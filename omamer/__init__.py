@@ -9,6 +9,6 @@ from .validation import *
 from .custom_seaborn import *
 from .plot import *
 from .run_pipeline import *
-from .visualization import *
+# from .visualization import *
 
 __version__ = "0.1"
