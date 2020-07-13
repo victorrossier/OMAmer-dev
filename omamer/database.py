@@ -5,7 +5,7 @@ import numpy as np
 import collections
 from Bio import SeqIO
 from tqdm import tqdm
-from itertools import repeat
+from itertools import repeat, chain
 from property_manager import lazy_property
 from ete3 import Tree
 from tables import open_file
@@ -18,6 +18,7 @@ from .hierarchy import (
     traverse_HOG, 
     is_ancestor
 )
+from .alphabets import Alphabet
 
 # new orthoxml export
 import re
@@ -91,6 +92,8 @@ class Database():
 		else:
 			self.mode = 'w'
 			self.db = tables.open_file(self.file, self.mode, filters=self._compr)
+
+		self.alphabet = Alphabet(n=21)
 
 	def __exit__(self, *_):
 		self.db.close()
@@ -1063,7 +1066,7 @@ class DatabaseFromOMA(Database):
 
 		            fam, curr_oma_roothog = _process_oma_hog(
 		                tax2level, curr_oma_taxa, curr_oma_hog, curr_oma_roothog, fam, fam2hogs, hog2oma_hog, hog2tax, roottax,
-		                include_younger_fams, tax_id2tax_off, tax_off2parent)
+		                include_younger_fams, tax_id2tax_off, tax_off2parent)  # these three args are actually useless
 
 		            # reset for new HOG
 		            curr_oma_taxa = []
@@ -1156,12 +1159,11 @@ class DatabaseFromOMA(Database):
 
 			# sp = b''.join(r['SciName'].split())  # because stop merging species and genus
 			sp = r['SciName']
+			sp_code = r['UniProtSpeciesCode'].decode('ascii')
 
+			# load a slice if species in taxonomy
 			# for ~27 cases the uniprot id replaces the scientific name in OMA species tree
-			if sp not in species:   
-				sp = r['UniProtSpeciesCode']
-
-			if sp in species:
+			if sp in species or sp_code in species:
 				entry_off = r['EntryOff']
 				entry_num = r['TotEntries']
 
@@ -1172,26 +1174,27 @@ class DatabaseFromOMA(Database):
 				sp_ent_tab = ent_tab[entry_off: entry_off + entry_num]
 
 				for rr in sp_ent_tab:
-				    oma_hog = rr['OmaHOG']
+					oma_hog = rr['OmaHOG']
 
-				    # select protein if member of selected OMA HOG
-				    if oma_hog in oma_hog2hog:
+					# select protein if member of selected OMA HOG
+					if oma_hog in oma_hog2hog:
 
-				        # update counter and track hogs and families
-				        hog = oma_hog2hog[oma_hog]
-				        fam = int(hog.split(b'.')[0].decode('ascii'))
-				        fam2prot_nr[fam] += 1
-				        prot_hogs.append(hog)
-				        prot_fams.append(fam) 
+						# update counter and track hogs and families
+						hog = oma_hog2hog[oma_hog]
+						fam = int(hog.split(b'.')[0].decode('ascii'))
+						fam2prot_nr[fam] += 1
+						prot_hogs.append(hog)
+						prot_fams.append(fam) 
 
-				        # track sequence length and offset
-				        oma_seq_off = rr['SeqBufferOffset']
-				        seq_len = rr['SeqBufferLength']
-				        oma_seq_offsets.append(oma_seq_off)
+						# track sequence length and offset
+						oma_seq_off = rr['SeqBufferOffset']
+						seq_len = rr['SeqBufferLength']
+						oma_seq_offsets.append(oma_seq_off)
 
-				        # store protein row
-				        prot_rows.append((rr['EntryNr'], 0, seq_len, spe_off, 0, 0))
-		
+						# store protein row
+						oma_id = '{}{:05d}'.format(sp_code, rr['EntryNr'] - entry_off + 1)
+						prot_rows.append((oma_id.encode('ascii'), 0, seq_len, spe_off, 0, 0))		
+
 		print(" - filter by family protein number")
 		# now filter the mappers
 		f_fam2hogs = collections.defaultdict(set)
@@ -1308,8 +1311,10 @@ class DatabaseFromOrthoXML(Database):
 	PANTHER could be a subclass of this one, even including the panther2orthoxml step.
 	One difference is how sequences are imported and the addition of GO information
 	'''
-	def __init__(self, path, root_taxon, name=None):
+	def __init__(self, path, root_taxon, name=None, min_fam_size=6):
 		super().__init__(path, root_taxon, name)
+
+		self.min_fam_size = min_fam_size
 
 	def build_database(self, orthoxml_file, stree_file, aln_files, pthfam_an2prot_file, overwrite=True, gene_id2hog_id_file=None, fam_hog_pthfam_ans_file=None):
 		'''
@@ -1325,21 +1330,22 @@ class DatabaseFromOrthoXML(Database):
 		tree_str = pyham.utils.get_newick_string(stree_file, type="nwk")
 		ham_analysis = pyham.Ham(tree_str, orthoxml_file, use_internal_name=True)
 
-		print("parse species and proteins")
-		prot_id2prot_off = self.parse_species_and_proteins(ham_analysis)
-
 		print("add SpeOff and TaxOff columns in taxonomy and species tables, respectively")
 		self.add_speoff_col()
 		self.add_taxoff_col()
 
 		print("parse families and HOGs")
 		if overwrite:
-			fam_id2hog_ids, hog_id2prot_ids, hog_id2tax_id = self.parse_families_and_hogs(ham_analysis, overwrite)
+			fam_id2hog_ids, hog_id2prot_ids, hog_id2tax_id = self.parse_families_and_hogs(ham_analysis, self.min_fam_size, overwrite)
 		else:
 			with open(gene_id2hog_id_file, 'r') as inf:
 			    gene_id2hog_id = dict(map(lambda x: x.rstrip().split(), inf.readlines()))
 
-			fam_id2hog_ids, hog_id2prot_ids, hog_id2tax_id = self.parse_families_and_hogs(ham_analysis, overwrite, gene_id2hog_id)
+			fam_id2hog_ids, hog_id2prot_ids, hog_id2tax_id = self.parse_families_and_hogs(ham_analysis, self.min_fam_size, overwrite, gene_id2hog_id)
+
+		print("parse species and proteins")
+		# only proteins from HOGs of selected families
+		prot_id2prot_off = self.parse_species_and_proteins(ham_analysis, hog_id2prot_ids)
 
 		# mapper HOG to taxon offset
 		hog_id2tax_off = {h: tax_id2tax_off.get(t, -1) for h, t in hog_id2tax_id.items()}
@@ -1379,44 +1385,9 @@ class DatabaseFromOrthoXML(Database):
 		self.db.close()
 		self.mode = 'r'
 		self.db = tables.open_file(self.file, self.mode, filters=self._compr)
-
-	def parse_species_and_proteins(self, ham_analysis):
-
-		# bookkeeping for later
-		prot_id2prot_off = {}
-
-		# store rows for species and protein tables
-		spe_rows = []
-		prot_rows = []
-
-		# pointer to protein in protein table
-		prot_off = 0
-		curr_prot_off = prot_off
-
-		# need to be sorted for later (add_speoff_col)
-		for spe_off, genome in enumerate(sorted(ham_analysis.get_list_extant_genomes(), key=lambda x: x.name)):
-
-			for gene in genome.genes:
-				# skip singletons (they are problematic with the update_prot_tab function)
-				if not gene.is_singleton():
-					prot_id = gene.prot_id.encode('ascii')
-					prot_rows.append((prot_id, 0, 0, spe_off, 0, 0))
-					prot_id2prot_off[prot_id] = prot_off
-					prot_off += 1
-
-			spe_rows.append((genome.name.encode('ascii'), curr_prot_off, prot_off - curr_prot_off, 0))
-			curr_prot_off = prot_off
-
-		# fill species and protein tables
-		self._sp_tab.append(spe_rows)
-		self._sp_tab.flush()
-		self._prot_tab.append(prot_rows)
-		self._prot_tab.flush()
-
-		return prot_id2prot_off
 	    
 	@staticmethod
-	def parse_families_and_hogs(ham_analysis, overwrite=True, gene_id2hog_id=None):
+	def parse_families_and_hogs(ham_analysis, min_fam_size, overwrite=True, gene_id2hog_id=None):
 	    
 	    def _parse_hogs(hog, hog_id, fam_id2hog_ids, fam_id, hog_id2tax_id, hog_id2prot_ids, overwrite, gene_id2hog_id):
 	        '''
@@ -1496,17 +1467,62 @@ class DatabaseFromOrthoXML(Database):
 	    hog_id2tax_id = {}
 
 	    for fam in ham_analysis.get_list_top_level_hogs():
-	        fam_id = roothog_id if overwrite else fam.hog_id
 
-	        # root HOG first (= family)
-	        fam_id2hog_ids[fam_id].add(fam_id.encode('ascii'))
-	        hog_id2tax_id[fam_id.encode('ascii')] = fam.genome.name.encode('ascii')
+	        # filter for size
+	        if len(fam.get_all_descendant_genes()) >= min_fam_size:
 
-	        _parse_hogs(fam, fam_id, fam_id2hog_ids, fam_id, hog_id2tax_id, hog_id2prot_ids, overwrite, gene_id2hog_id)
+	            fam_id = roothog_id if overwrite else fam.hog_id
+
+	            # root HOG first (= family)
+	            fam_id2hog_ids[fam_id].add(fam_id.encode('ascii'))
+	            hog_id2tax_id[fam_id.encode('ascii')] = fam.genome.name.encode('ascii')
+
+	            _parse_hogs(fam, fam_id, fam_id2hog_ids, fam_id, hog_id2tax_id, hog_id2prot_ids, overwrite, gene_id2hog_id)
 	        
-	        roothog_id += 1 # used if overwrite
-	    
+	            roothog_id += 1 # used if overwrite
+
 	    return fam_id2hog_ids, hog_id2prot_ids, hog_id2tax_id
+
+	def parse_species_and_proteins(self, ham_analysis, hog_id2prot_ids):
+
+		# keep proteins from selected HOGs (from families with >= min_fam_size)
+		prot_id_filter = set(chain(*hog_id2prot_ids.values()))
+
+		# bookkeeping for later
+		prot_id2prot_off = {}
+
+		# store rows for species and protein tables
+		spe_rows = []
+		prot_rows = []
+
+		# pointer to protein in protein table
+		prot_off = 0
+		curr_prot_off = prot_off
+
+		# need to be sorted for later (add_speoff_col)
+		for spe_off, genome in enumerate(sorted(ham_analysis.get_list_extant_genomes(), key=lambda x: x.name)):
+
+			for gene in genome.genes:
+				# # skip singletons (they are problematic with the update_prot_tab function)
+				# if not gene.is_singleton():
+				prot_id = gene.prot_id.encode('ascii')
+
+				# keep only proteins from selected HOGs (from families with >= min_fam_size)
+				if prot_id in prot_id_filter:
+					prot_rows.append((prot_id, 0, 0, spe_off, 0, 0))
+					prot_id2prot_off[prot_id] = prot_off
+					prot_off += 1
+
+			spe_rows.append((genome.name.encode('ascii'), curr_prot_off, prot_off - curr_prot_off, 0))  # what if no protein?
+			curr_prot_off = prot_off
+
+		# fill species and protein tables
+		self._sp_tab.append(spe_rows)
+		self._sp_tab.flush()
+		self._prot_tab.append(prot_rows)
+		self._prot_tab.flush()
+
+		return prot_id2prot_off
 
 	def load_sequence_buffer(self, aln_files, pthfam_an_id2prot_id):
 
@@ -1532,7 +1548,7 @@ class DatabaseFromOrthoXML(Database):
 					if prot_id in prot_id2prot_off:
 						prot_off = prot_id2prot_off[prot_id]
 
-						seq = "{} ".format(rec.seq.ungap('-'))
+						seq = "{} ".format(self.alphabet.sanitize_seq(rec.seq.ungap('-')))
 						seq_len = len(seq)
 						seq_buff += seq
 

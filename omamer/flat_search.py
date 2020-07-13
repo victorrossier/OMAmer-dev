@@ -174,7 +174,7 @@ class FlatSearch():
             return self.fs.create_earray('/', 'QueryOccur', tables.UInt32Atom(1), (0,), filters=self.db._compr)
 
     # flat search function
-    def flat_search(self, seqs=None, ids=None, fasta_file=None, query_sp=None):
+    def flat_search(self, seqs=None, ids=None, fasta_file=None, query_sp=None, chunksize=500):
         '''
         to limit code duplication in FlatSearchValidation 
         '''
@@ -189,37 +189,50 @@ class FlatSearch():
             self.query_species = ''.join(query_sp.split())
             sb = QuerySequenceBuffer(db=self.db, query_sp=self.query_species)
 
-        self._flat_search(sb)
+        self._flat_search(sb, chunksize)
 
-    def _flat_search(self, sbuff):
+    def _flat_search(self, sbuff, chunksize):
 
-        print('look-up k-mer table')
-        # fam_ranked, queryFam_count, queryFam_occur, queryHog_count, queryHog_occur, query_count, query_occur = self.lookup(sbuff)
-        fam_ranked, queryFam_count, queryFam_occur, queryHog_count, queryHog_occur, query_count, query_occur = self._lookup(
-            sbuff.buff, sbuff.idx, self.trans, self.table_idx, self.table_buff, self.db._hog_tab.col('FamOff'), self.db._fam_tab.nrows, 
-            self.db._hog_tab.nrows, self.ki.k, self.ki.alphabet.DIGITS_AA_LOOKUP)
+        # to reduce memory footprint, process in chunk
+        i = 0
+        while i <= sbuff.prot_nr:
+            print('look-up k-mer table')
+            seqs_idx = sbuff.idx[i:i + chunksize + 1]
+            seqs = sbuff.buff[seqs_idx[0]:seqs_idx[-1]]
+            
+            # important to reinitializae seqs_idx
+            seqs_idx -= seqs_idx[0]
+            seq_ids = sbuff.ids[i:i + chunksize]
+            
+            # search
+            (fam_ranked, queryFam_count, queryFam_occur, queryHog_count, queryHog_occur, query_count, query_occur) = self._lookup(
+                        seqs, seqs_idx, self.trans, self.table_idx, self.table_buff, self.db._hog_tab.col('FamOff'), self.db._fam_tab.nrows, 
+                        self.db._hog_tab.nrows, self.ki.k, self.ki.alphabet.DIGITS_AA_LOOKUP)
+            
+            print('store results for flat search')
+            self._fam_ranked.append(fam_ranked)
+            self._fam_ranked.flush()
+            self._queryFam_count.append(queryFam_count)
+            self._queryFam_count.flush()
+            self._queryFam_occur.append(queryFam_occur)
+            self._queryFam_occur.flush()
+            self._queryHog_count.append(queryHog_count)
+            self._queryHog_count.flush()
+            self._queryHog_occur.append(queryHog_occur)
+            self._queryHog_occur.flush()
 
-        print('store results for flat search')
-        self._fam_ranked.append(fam_ranked)
-        self._fam_ranked.flush()
-        self._queryFam_count.append(queryFam_count)
-        self._queryFam_count.flush()
-        self._queryFam_occur.append(queryFam_occur)
-        self._queryFam_occur.flush()
-        self._queryHog_count.append(queryHog_count)
-        self._queryHog_count.flush()
-        self._queryHog_occur.append(queryHog_occur)
-        self._queryHog_occur.flush()
-        # store as vertical vectors
-        self._query_count.append(query_count[:,None])
-        self._query_count.flush()
-        self._query_occur.append(query_occur[:,None])
-        self._query_occur.flush()
+            # store as vertical vectors
+            self._query_count.append(query_count[:,None])
+            self._query_count.flush()
+            self._query_occur.append(query_occur[:,None])
+            self._query_occur.flush()
 
-        # store ids of sbuff
-        self.append_queries(sbuff.ids)
+            # store ids of sbuff
+            self.append_queries(seq_ids)
+            
+            i += chunksize
 
-        self.reset_cache()
+        # self.reset_cache() --> not sure if necessary
 
         # close and re-open in read mode
         self.fs.close()
@@ -271,6 +284,7 @@ class FlatSearch():
                     pass
                 elif r1[0] == x_kmer:
                     continue
+                
                 # search hogs and fams
                 hog_res = np.zeros(n_hogs, dtype=np.uint16)
                 fam_res = np.zeros(n_fams, dtype=np.uint16)
@@ -296,6 +310,7 @@ class FlatSearch():
                     hog_occ[hogs] += np.uint32(kmer_occ)
                     fam_occ[fams] += np.uint32(kmer_occ)  # I think here it should be len(fams) instead of len(hogs) ... # actually fine because one hog for one fam...
 
+                # TO DO: store only top_n families and corresponding HOGs
                 # report results for families sorted by k-mer count
                 t = np.argsort(fam_res)[::-1]  
                 fam_results[zz, :n_fams] = t
@@ -343,14 +358,14 @@ class FlatSearchValidation(FlatSearch):
         else:
             return self.fs.create_earray('/', 'QueryID', tables.UInt64Atom(1), (0,), filters=self.db._compr)
 
-    def flat_search(self):
+    def flat_search(self, chunksize=500):
 
         assert (self.mode in {'w', 'a'}), 'Search must be opened in write mode.'
 
         # load query sequences
         qbuff = QuerySequenceBuffer(db=self.db, query_sp=self.query_species)
 
-        self._flat_search(qbuff)
+        self._flat_search(qbuff, chunksize)
 
     def append_queries(self, ids):
         self._query_id.append(ids)

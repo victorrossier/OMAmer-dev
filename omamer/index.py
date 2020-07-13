@@ -15,6 +15,8 @@ from property_manager import lazy_property, cached_property
 from .hierarchy import get_lca_hog_off
 from .alphabets import Alphabet
 
+import ctypes
+
 '''
 Questions:
  - can we parallelize the k-mer table computation (parallel=True makes it slower despite using more CPUs)
@@ -101,40 +103,13 @@ class Index():
     def _hog_count(self):
         return self._get_node_if_exist('/HOGcount')
 
-    # @property  
-    # def _table_idx(self):
-    #     if '/TableIndex' in self.ki:
-    #         return self.ki.root.TableIndex
-    #     else:
-    #         return None
-
-    # @property  
-    # def _table_buff(self):
-    #     if '/TableBuffer' in self.ki:
-    #         return self.ki.root.TableBuffer
-    #     else:
-    #         return None
-        
-    # @property  
-    # def _fam_count(self):
-    #     if '/FamCount' in self.ki:
-    #         return self.ki.root.FamCount
-    #     else:
-    #         return None
-
-    # @property  
-    # def _hog_count(self):
-    #     if '/HOGcount' in self.ki:
-    #         return self.ki.root.HOGcount
-    #     else:
-    #         return None
-
     ### main function to build the index ###
     def build_kmer_table(self):
         
         assert (self.mode in {'w', 'a'}), 'Index must be opened in write mode.'
 
         # build suffix array with option to translate the sequence buffer first
+        print(' - build suffix array')
         sa = self._build_suffixarray(self.alphabet.translate(self.db._seq_buff[:]), len(self.db._prot_tab))
 
         # Set nthreads, note: this only works before numba called first time!
@@ -153,7 +128,8 @@ class Index():
 
         assert (self.mode in {'w', 'a'}), 'Index must be opened in write mode.'
 
-        @numba.njit(parallel=True)
+        #@numba.njit(parallel=True) --> was breaking for PANTHER database
+        @numba.njit
         def _compute_mask_and_filter(sa, sa_mask, sa_filter, k, n, prot2spoff, prot2hogoff, sp_filter):
             '''
             1. compute a mapper between suffixes and HOGs
@@ -312,8 +288,8 @@ class IndexValidation(Index):
     def __init__(self, db, path=None, k=6, reduced_alphabet=False, nthreads=1, stree_path=None, hidden_taxon=None):
         
         assert hidden_taxon, 'A hidden taxon must be defined'
-        self.hidden_taxon = ''.join(hidden_taxon.split())
-        name = 'wo_{}_k{}_{}'.format(self.hidden_taxon, k, 'A13' if reduced_alphabet else 'A21')
+        name = 'wo_{}_k{}_{}'.format(hidden_taxon, k, 'A13' if reduced_alphabet else 'A21')
+        self.hidden_taxon = hidden_taxon.encode('ascii')
 
         super().__init__(db, name, path, k, reduced_alphabet, nthreads)
 
@@ -491,9 +467,26 @@ class QuerySequenceBuffer(SequenceBuffer):
         self._prot_tab = db._prot_tab[self.prot_off: self.prot_off + sp_ent['ProtNum']]
         
     def filter_query_seq_buff(self, db):
-        self._seq_buff = db._seq_buff[self._prot_tab[0]['SeqOff']: self._prot_tab[-1]['SeqOff'] + self._prot_tab[-1]['SeqLen']]
+        seq_buff = db._seq_buff[:]
+        qseq_buff = []
+        qseq_off_col = []
+        qseq_off = 0
+        for prot_ent in self._prot_tab:
+            seq_off = prot_ent['SeqOff']
+            seq_len = prot_ent['SeqLen']
+            qseq_buff.extend(seq_buff[seq_off: seq_off + seq_len])
+            
+            # need to change the seq_buff offset too
+            qseq_off_col.append(int(qseq_off))
+            qseq_off += seq_len
+
+        self._seq_buff = np.array(qseq_buff, dtype='|S1')
+        self._prot_tab['SeqOff'] = qseq_off_col
+        
+        # required seq_buff to be sorted by species
+        # self._seq_buff = db._seq_buff[self._prot_tab[0]['SeqOff']: self._prot_tab[-1]['SeqOff'] + self._prot_tab[-1]['SeqLen']]
         # initialize sequence buffer offset
-        self._prot_tab['SeqOff'] -= db._prot_tab[self.prot_off]['SeqOff']
+        # self._prot_tab['SeqOff'] -= db._prot_tab[self.prot_off]['SeqOff']
 
 # END of OMAmer
 ################################################################################################################################################

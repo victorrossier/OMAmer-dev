@@ -101,7 +101,7 @@ class Search():
         else:
             return self.se.create_earray('/', 'BestPathMask', tables.BoolAtom(self.db._hog_tab.nrows), (0,), filters=self.db._compr)
 
-    def search(self, top_n=10):
+    def search(self, top_n=10, chunksize=500):
         '''
         args
          - top_n: top n families on which compute the score and if cum_mode='max', also on which to cumulate counts.
@@ -110,34 +110,133 @@ class Search():
         '''
         assert top_n <= self.db._fam_tab.nrows, 'top n is smaller than number of families'
 
+        # reference HOG cum counts
+        if self.cum_mode == 'max':
+            # cumulate HOG counts
+            hog_cum_counts = self.cumulate_counts_nfams(
+                self.ki._hog_count[:], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), self.cumulate_counts_1fam, self._sum, self._max)            
+        
+        elif self.cum_mode == 'sum':
+            # cumulate HOG counts
+            hog_cum_counts = self.cumulate_counts_nfams(
+                self.ki._hog_count[:], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), self.cumulate_counts_1fam, self._sum, self._sum)
+        
+        # get family cumulated counts
+        fam_cum_counts = hog_cum_counts[self.db._fam_tab.col('HOGoff')]
+        
+        # process by chunk to save memory
+        i = 0
+        while (i + chunksize) <= self.fs._fam_ranked.nrows:
+
+            print('compute family scores')
+            # filter top n families
+            fam_ranked_n = self.fs._fam_ranked[i:i + chunksize][:,:top_n]
+
+            # cumulated queryHOG counts for the top n families
+            if self.cum_mode == 'max':
+                queryHog_cum_counts = self.cumulate_counts_nfams_nqueries(
+                    fam_ranked_n, self.fs._queryHog_count[i:i + chunksize], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), 
+                    chunksize, self.cumulate_counts_1fam, self._sum, self._max)
+
+                # update queryFam counts to have maxed counts instead of summed counts (using root-HOG maxed counts)
+                fam_rh_offsets = self.db._fam_tab.col('HOGoff')[fam_ranked_n]
+                queryFam_cum_counts = queryHog_cum_counts[np.arange(fam_rh_offsets.shape[0])[:,None], fam_rh_offsets]
+
+            # if sum, already cumulated during flat search
+            elif self.cum_mode == 'sum':
+                queryFam_cum_counts = self.fs._queryFam_count[i:i + chunksize][np.arange(fam_ranked_n.shape[0])[:,None], fam_ranked_n]
+
+            # normalize family cum counts
+            if self.score == 'naive':
+                queryFam_scores = queryFam_cum_counts
+                fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, False)
+
+            elif self.score in {'querysize', 'correct_querysize'}:
+                queryFam_scores = queryFam_cum_counts / self.fs._query_count[i:i + chunksize]
+                fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, False)
+
+            elif self.score == 'theo_prob':
+                queryFam_scores = self.compute_family_theo_probs(
+                    fam_ranked_n, self.fs._query_count[i:i + chunksize], queryFam_cum_counts, fam_cum_counts, self.ki.k, self.ki.alphabet.n)
+                fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, True)
+
+            elif self.score == 'kmerfreq_prob':
+                queryFam_scores = self.compute_family_kmerfreq_probs(
+                    fam_ranked_n, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], queryFam_cum_counts, fam_cum_counts, self.nr_kmer)
+                fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, True)
+
+            elif self.score == 'kmerfreq_probdiv6':
+                queryFam_scores = self.compute_family_kmerfreq_probs(
+                    fam_ranked_n, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], queryFam_cum_counts, fam_cum_counts, self.nr_kmer, True)
+                fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, True)
+
+            print('compute subfamily scores')
+            ### Subfamilies
+            # compute queryHog_cum_counts if cum_mode == sum
+            if self.cum_mode == 'sum':
+                queryHog_cum_counts = self.cumulate_counts_nfams_nqueries(
+                    fam_reranked_1, self.fs._queryHog_count[i:i + chunksize], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), 
+                    self.fs._query_count.nrows, self.cumulate_counts_1fam, self._sum, self._sum)
+
+            if self.score == 'naive':
+                queryHog_scores, queryHog_bestpaths = self.norm_hog_naive(fam_reranked_1, queryHog_cum_counts)
+
+            elif self.score == 'querysize':
+                queryHog_scores, queryHog_bestpaths = self.norm_hog_query_size(fam_reranked_1, queryHog_cum_counts)
+
+            # not sure the other are update for chunksize
+            elif self.score == 'correct_querysize':
+                queryHog_scores, queryHog_bestpaths = self.norm_hog_correct_query_size(
+                    fam_reranked_1, queryHog_cum_counts, self.fs._query_count[i:i + chunksize], self.fs._queryHog_count[i:i + chunksize])
+
+            elif self.score == 'theo_prob':
+                queryHog_scores, queryHog_bestpaths = self.compute_subfamily_theo_probs(
+                    fam_reranked_1, self.fs._query_count[i:i + chunksize], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], self.db._chog_arr[:], 
+                    queryHog_cum_counts, hog_cum_counts, self.ki.k, self.ki.alphabet.n, self.fs._queryHog_count[i:i + chunksize])
+
+            elif self.score == 'kmerfreq_prob':
+                queryHog_scores, queryHog_bestpaths = self.compute_subfamily_kmerfreq_probs(
+                    fam_reranked_1, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], 
+                    self.db._chog_arr[:], queryHog_cum_counts, hog_cum_counts, self.fs._queryHog_count[i:i + chunksize], self.fs._queryHog_occur[i:i + chunksize], self.nr_kmer)
+
+            elif self.score == 'kmerfreq_probdiv6':
+                queryHog_scores, queryHog_bestpaths = self.compute_subfamily_kmerfreq_probs(
+                    fam_reranked_1, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], 
+                    self.db._chog_arr[:], queryHog_cum_counts, hog_cum_counts, self.fs._queryHog_count[i:i + chunksize], self.fs._queryHog_occur[i:i + chunksize], self.nr_kmer, True)
+          
+            print('store results')
+            # store results for hogs
+            self._hog_score.append(queryHog_scores)
+            self._hog_score.flush()
+            self._bestpath_mask.append(queryHog_bestpaths)
+            self._bestpath_mask.flush()
+
+            # store results for families
+            self._res_tab.append(list(zip(*[self.fs._query_id[i:i + chunksize].flatten(), fam_reranked_1[:,0], queryFam_scores[:, 0]])))
+            self._res_tab.flush()
+
+            i += chunksize
+
+        ### ---> end
+        chunksize = self.fs._fam_ranked.nrows - i
+
         print('compute family scores')
         # filter top n families
-        fam_ranked_n = self.fs._fam_ranked[:][:,:top_n]
+        fam_ranked_n = self.fs._fam_ranked[i:i + chunksize][:,:top_n]
 
         # cumulated queryHOG counts for the top n families
         if self.cum_mode == 'max':
             queryHog_cum_counts = self.cumulate_counts_nfams_nqueries(
-                fam_ranked_n, self.fs._queryHog_count[:], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), 
-                self.fs._query_count.nrows, self.cumulate_counts_1fam, self._sum, self._max)
+                fam_ranked_n, self.fs._queryHog_count[i:i + chunksize], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), 
+                chunksize, self.cumulate_counts_1fam, self._sum, self._max)
 
             # update queryFam counts to have maxed counts instead of summed counts (using root-HOG maxed counts)
             fam_rh_offsets = self.db._fam_tab.col('HOGoff')[fam_ranked_n]
             queryFam_cum_counts = queryHog_cum_counts[np.arange(fam_rh_offsets.shape[0])[:,None], fam_rh_offsets]
 
-            # cumulate HOG counts
-            hog_cum_counts = self.cumulate_counts_nfams(
-                self.ki._hog_count[:], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), self.cumulate_counts_1fam, self._sum, self._max)            
-
         # if sum, already cumulated during flat search
         elif self.cum_mode == 'sum':
-            queryFam_cum_counts = self.fs._queryFam_count[:][np.arange(fam_ranked_n.shape[0])[:,None], fam_ranked_n]
-
-            # cumulate HOG counts
-            hog_cum_counts = self.cumulate_counts_nfams(
-                self.ki._hog_count[:], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), self.cumulate_counts_1fam, self._sum, self._sum)
-
-        # get family cumulated counts
-        fam_cum_counts = hog_cum_counts[self.db._fam_tab.col('HOGoff')]
+            queryFam_cum_counts = self.fs._queryFam_count[i:i + chunksize][np.arange(fam_ranked_n.shape[0])[:,None], fam_ranked_n]
 
         # normalize family cum counts
         if self.score == 'naive':
@@ -145,22 +244,22 @@ class Search():
             fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, False)
 
         elif self.score in {'querysize', 'correct_querysize'}:
-            queryFam_scores = queryFam_cum_counts / self.fs._query_count[:]
+            queryFam_scores = queryFam_cum_counts / self.fs._query_count[i:i + chunksize]
             fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, False)
 
         elif self.score == 'theo_prob':
             queryFam_scores = self.compute_family_theo_probs(
-                fam_ranked_n, self.fs._query_count[:], queryFam_cum_counts, fam_cum_counts, self.ki.k, self.ki.alphabet.n)
+                fam_ranked_n, self.fs._query_count[i:i + chunksize], queryFam_cum_counts, fam_cum_counts, self.ki.k, self.ki.alphabet.n)
             fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, True)
 
         elif self.score == 'kmerfreq_prob':
             queryFam_scores = self.compute_family_kmerfreq_probs(
-                fam_ranked_n, self.fs._query_count[:], self.fs._query_occur[:], queryFam_cum_counts, fam_cum_counts, self.nr_kmer)
+                fam_ranked_n, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], queryFam_cum_counts, fam_cum_counts, self.nr_kmer)
             fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, True)
 
         elif self.score == 'kmerfreq_probdiv6':
             queryFam_scores = self.compute_family_kmerfreq_probs(
-                fam_ranked_n, self.fs._query_count[:], self.fs._query_occur[:], queryFam_cum_counts, fam_cum_counts, self.nr_kmer, True)
+                fam_ranked_n, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], queryFam_cum_counts, fam_cum_counts, self.nr_kmer, True)
             fam_reranked_1, queryFam_scores = self.reranked_families_and_scores(queryFam_scores, fam_ranked_n, True)
 
         print('compute subfamily scores')
@@ -168,7 +267,7 @@ class Search():
         # compute queryHog_cum_counts if cum_mode == sum
         if self.cum_mode == 'sum':
             queryHog_cum_counts = self.cumulate_counts_nfams_nqueries(
-                fam_reranked_1, self.fs._queryHog_count[:], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), 
+                fam_reranked_1, self.fs._queryHog_count[i:i + chunksize], self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), 
                 self.fs._query_count.nrows, self.cumulate_counts_1fam, self._sum, self._sum)
 
         if self.score == 'naive':
@@ -177,23 +276,25 @@ class Search():
         elif self.score == 'querysize':
             queryHog_scores, queryHog_bestpaths = self.norm_hog_query_size(fam_reranked_1, queryHog_cum_counts)
 
+        # not sure the other are update for chunksize
         elif self.score == 'correct_querysize':
-            queryHog_scores, queryHog_bestpaths = self.norm_hog_correct_query_size(fam_reranked_1, queryHog_cum_counts)
+            queryHog_scores, queryHog_bestpaths = self.norm_hog_correct_query_size(
+                fam_reranked_1, queryHog_cum_counts, self.fs._query_count[i:i + chunksize], self.fs._queryHog_count[i:i + chunksize])
 
         elif self.score == 'theo_prob':
             queryHog_scores, queryHog_bestpaths = self.compute_subfamily_theo_probs(
-                fam_reranked_1, self.fs._query_count[:], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], self.db._chog_arr[:], 
-                queryHog_cum_counts, hog_cum_counts, self.ki.k, self.ki.alphabet.n, self.fs._queryHog_count[:])
+                fam_reranked_1, self.fs._query_count[i:i + chunksize], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], self.db._chog_arr[:], 
+                queryHog_cum_counts, hog_cum_counts, self.ki.k, self.ki.alphabet.n, self.fs._queryHog_count[i:i + chunksize])
 
         elif self.score == 'kmerfreq_prob':
             queryHog_scores, queryHog_bestpaths = self.compute_subfamily_kmerfreq_probs(
-                fam_reranked_1, self.fs._query_count[:], self.fs._query_occur[:], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], 
-                self.db._chog_arr[:], queryHog_cum_counts, hog_cum_counts, self.fs._queryHog_count[:], self.fs._queryHog_occur[:], self.nr_kmer)
+                fam_reranked_1, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], 
+                self.db._chog_arr[:], queryHog_cum_counts, hog_cum_counts, self.fs._queryHog_count[i:i + chunksize], self.fs._queryHog_occur[i:i + chunksize], self.nr_kmer)
 
         elif self.score == 'kmerfreq_probdiv6':
             queryHog_scores, queryHog_bestpaths = self.compute_subfamily_kmerfreq_probs(
-                fam_reranked_1, self.fs._query_count[:], self.fs._query_occur[:], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], 
-                self.db._chog_arr[:], queryHog_cum_counts, hog_cum_counts, self.fs._queryHog_count[:], self.fs._queryHog_occur[:], self.nr_kmer, True)
+                fam_reranked_1, self.fs._query_count[i:i + chunksize], self.fs._query_occur[i:i + chunksize], self.db._fam_tab[:], queryFam_scores, self.db._hog_tab[:], 
+                self.db._chog_arr[:], queryHog_cum_counts, hog_cum_counts, self.fs._queryHog_count[i:i + chunksize], self.fs._queryHog_occur[i:i + chunksize], self.nr_kmer, True)
       
         print('store results')
         # store results for hogs
@@ -203,11 +304,11 @@ class Search():
         self._bestpath_mask.flush()
 
         # store results for families
-        self._res_tab.append(list(zip(*[self.fs._query_id[:].flatten(), fam_reranked_1[:,0], queryFam_scores[:, 0]])))
+        self._res_tab.append(list(zip(*[self.fs._query_id[i:i + chunksize].flatten(), fam_reranked_1[:,0], queryFam_scores[:, 0]])))
         self._res_tab.flush()
 
         # reset cache
-        self.reset_cache()
+        # self.reset_cache()
 
         # close and re-open in read mode
         self.se.close()
@@ -489,9 +590,9 @@ class Search():
         
         return queryHog_score, queryHog_bestpath
 
-    def norm_hog_correct_query_size(self, fam_ranked, queryHog_cum_count):
-        return self._norm_hog_correct_query_size(queryHog_cum_count, fam_ranked, self.fs._query_count[:], 
-            self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), self.fs._queryHog_count[:])
+    def norm_hog_correct_query_size(self, fam_ranked, queryHog_cum_count, query_count, queryHog_count):
+        return self._norm_hog_correct_query_size(queryHog_cum_count, fam_ranked, query_count, 
+            self.db._fam_tab[:], self.db._level_arr[:], self.db._hog_tab.col('ParentOff'), queryHog_count)
 
     def _norm_hog_correct_query_size(self, queryHog_cum_count, fam_ranked, query_count, fam_tab, level_arr, hog2parent, queryHog_count):
 

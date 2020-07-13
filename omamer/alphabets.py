@@ -29,12 +29,14 @@ class Alphabet(object):
 
     def setup(self):
         if self.n == 21:
+            chars = set('ACDEFGHIKLMNPQRSTVWXY')
             digits = np.frombuffer(b'ACDEFGHIKLMNPQRSTVWXY', dtype=np.uint8)
             lookup = np.zeros(np.max(digits)+1, dtype=np.uint8)
             lookup[digits] = np.arange(len(digits))
             trans = None
         elif self.n == 13:
             # Reduced from Linclust merges (A, S, T), (D, N), (E, Q), (F, Y), (I, V), (K, R) and (L, M)
+            chars = set('ACDEFGHIKLPWX')
             digits = np.frombuffer(b'ACDEFGHIKLPWX', dtype=np.uint8)
             lookup = np.zeros(ord(b'Y')+1, dtype=np.uint8)
             lookup[digits] = np.arange(len(digits))
@@ -78,6 +80,7 @@ class Alphabet(object):
         else:
             raise ValueError('Unknown reduced alphabet.')
 
+        self.chars = chars
         self.digits = digits
         self.lookup = lookup
         self.trans = trans
@@ -87,6 +90,10 @@ class Alphabet(object):
             return x
         else:
             return self.trans[x.view(np.uint8)].view('|S1')
+
+    def sanitize_seq(self, seq):
+        #assert type(seq) == str
+        return ''.join([x if x in self.chars else 'X' for x in seq])
 
     @property
     def DIGITS_AA_LOOKUP(self):
